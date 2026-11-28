@@ -19,8 +19,11 @@ from fractions import Fraction
 import hashlib
 import hmac
 import json
+import os
 from pathlib import Path
 import re
+import secrets
+import stat
 import sys
 from typing import Any, Dict, FrozenSet, List, Optional, Sequence, Tuple
 import unicodedata
@@ -29,6 +32,8 @@ SCHEMA_GOV = "aletheion.hysteresis_thermal_governor.v1"
 TELEMETRY_SCOPE_POLICY = "TEMPERATURE_AND_CHATTER_ONLY"
 MAX_JSON_DEPTH = 32
 MAX_INT_ABS = 10**18
+MAX_POLICY_TEXT_LEN = 4096
+MAX_INPUT_BYTES = 16 * 1024 * 1024
 
 # UX582HS sustained thermal gear ladder (exact rational degrees C, 5 C deadband):
 #   Gear 0 (NOMINAL)     -> escalates to 1 at >= 70 C; returns from 1 at <= 65 C
@@ -100,25 +105,60 @@ _FORBIDDEN_KEY_TOKENS: FrozenSet[str] = frozenset(
         "power",
         "energy",
         "wattage",
+        "rapl",
     }
 )
-_FORBIDDEN_COMPACT_KEY_RE = re.compile(
-    r"(?:watt|joule|energy|power|tdp|pwr|kwh|mwh|gwh|twh|whr|mjpertok|jpertok|ujpertok|wpertok|whpertok)"
+_FORBIDDEN_GLUED_TOKEN_RE = re.compile(
+    r"(?:watt|joule|energy|power|nvmldevicegetpower|nvmldevicegettotalenergy)"
+    r"|^(?:mj|j|uj|w|wh|kwh|mwh)pertok(?:en)?s?$"
+    r"|^tok(?:en)?s?per(?:mj|j|uj|w|wh|kwh|mwh)$"
+    r"|^(?:avg|max|min|pkg|gpu|cpu|nvml|total)(?:power|energy|watt|tdp|pwr|mw|uj|mj|wh|kwh|mwh)$"
+    r"|^(?:intel)?rapl$"
 )
 _PFX = r"(?:p|n|u|\u03bc|m|k|g|t|pico|nano|micro|milli|kilo|mega|giga|tera)"
-_UNIT = r"(?:watt[^a-z0-9]*hours?|watthours?|watts?|joules?|whrs?|wh|w|j|tdp)"
-_SEP = r"[^a-z0-9]*"
-_NUM = r"\d[\d.,]*(?:e[+-]?\d+)?"
+_UNIT = r"(?:wattage|watt[^a-z0-9]{0,2}hours?|watthours?|watts?|joules?|whrs?|wh|w|j|tdp)"
+_FULL_UNIT = r"(?:wattage|watt[^a-z0-9]{0,2}hours?|watthours?|watts?|joules?|whrs?|wh|tdp)"
+_SEP = r"[^a-z0-9]{0,4}"
+_NUM = r"(?<!\d)\d{1,18}(?:[.,]\d{1,18}){0,4}(?:e[+-]?\d{1,4})?"
+_MOD = r"(?:[a-z]{1,24}[\s_]{1,4}){0,2}"
+_WORD_NUM = (
+    r"(?:zero|one|two|three|four|five|six|seven|eight|nine|ten|eleven|twelve|thirteen|"
+    r"fourteen|fifteen|sixteen|seventeen|eighteen|nineteen|twenty|thirty|forty|fifty|"
+    r"sixty|seventy|eighty|ninety|hundred|thousand)"
+    r"(?:[-\s]{1,2}(?:one|two|three|four|five|six|seven|eight|nine|hundred|thousand)){0,2}"
+)
 _FORBIDDEN_VALUE_RE = re.compile(
     "(?:"
-    rf"{_NUM}{_SEP}(?:{_PFX}{_SEP})?{_UNIT}(?![a-z0-9])(?!/\s)"
-    rf"|(?<![a-z0-9])(?:{_PFX}{_SEP})?{_UNIT}\s*[:=_]\s*{_NUM}"
-    rf"|(?<![a-z0-9])tdp[^a-z0-9]*{_NUM}"
-    rf"|^[^a-z0-9]*(?:{_PFX}{_SEP})?{_UNIT}[^a-z0-9]*$"
-    r"|\b(?:joules?|watts?|mj|uj|kwh|wh)\s*(?:per|/)\s*tok(?:en)?s?\b"
-    r"|\b(?:less|lower|reduced|fewer)\s+(?:in\s+)?(?:energy|power)\b"
-    r"|\b(?:energy|power)\s+(?:use|usage|reduction|savings?|dropped|consumption|draw)\b"
+    rf"{_NUM}{_SEP}(?:{_PFX}{_SEP})?{_UNIT}(?![a-z0-9])(?!/o(?![a-z0-9])|/\s+(?!tok(?:en)?s?(?![a-z0-9])|s(?:ec(?:ond)?s?)?(?![a-z0-9])))"
+    rf"|(?<![a-z0-9])(?:{_PFX}{_SEP})?{_UNIT}(?:\s{{0,4}}[:_]\s{{0,4}}|=){_NUM}"
+    rf"|(?<![a-z0-9])(?:(?:{_PFX}{_SEP})?{_FULL_UNIT}|{_PFX}{_SEP}[wj])\s{{0,4}}=\s{{0,4}}{_NUM}"
+    rf"|(?<![a-z0-9])(?:energy|power)\s{{0,4}}[:=_]\s{{0,4}}{_NUM}"
+    rf"|(?<![a-z0-9]){_WORD_NUM}\s{{1,4}}(?:{_PFX}[\s-]{{0,2}})?(?:watts?|joules?|watt[-\s]?hours?|watthours?)(?![a-z0-9])"
+    rf"|(?<![a-z0-9])tdp[^a-z0-9]{{0,4}}{_NUM}"
+    rf"|^[^a-z0-9]{{0,4}}(?:{_PFX}{_SEP})?{_UNIT}[^a-z0-9]{{0,4}}$"
+    rf"|(?<![a-z0-9])(?:(?:{_PFX}[\s_]{{0,2}})?(?:joules?|watts?|whrs?|wh|j)|{_PFX}[\s_]{{0,2}}w|energy|power)(?:[\s_]{{1,4}}per[\s_]{{1,4}}|\s{{0,4}}/\s{{0,4}}){_MOD}tok(?:en)?s?(?![a-z0-9])"
+    rf"|(?<![a-z0-9])w(?:[\s_]{{1,4}}per[\s_]{{1,4}}|/(?!\s)){_MOD}tok(?:en)?s?(?![a-z0-9])"
+    rf"|(?<![a-z0-9])tok(?:en)?s?(?:[\s_]{{1,4}}per[\s_]{{1,4}}|\s{{0,4}}/\s{{0,4}}){_MOD}(?:(?:{_PFX}[\s_]{{0,2}})?(?:joules?|watts?|whrs?|wh|j|w)|energy|power)(?![a-z0-9])"
+    r"|(?<![a-z0-9])(?:(?:peak|mean|avg|average|max|min|total|gpu|cpu|laptop|system|board|pkg|package|wall|socket|measured|reported|low|lower|high|reduced)\s{1,4}(?:[a-z]{1,24}\s{1,4})?wattage|wattage\s{1,4}(?:draw|use|usage|consumption|reduction|savings?|limit|cap|budget|reading|measurement|telemetry))(?![a-z0-9])"
+    r"|(?<![a-z0-9])(?:intel[-_ ]?)?rapl(?![a-z0-9])"
+    r"|(?<![a-z0-9])nvml[-_ ]{0,4}(?:device[-_ ]{0,4}get[-_ ]{0,4})?(?:total[-_ ]{0,4})?(?:power|energy|watt|(?:mw|uj)(?![a-z0-9]))"
+    r"|(?<![a-z0-9])nvidia[-_ ]?smi(?![a-z0-9])(?:(?:\s{0,8}$)|[^;\n]{0,256}(?<![a-z0-9])(?:power|watt|energy|draw|tdp)(?![a-z0-9]))"
+    r"|(?<![a-z0-9])(?:less|lower|reduced|fewer)\s{1,4}(?:in\s{1,4})?(?:energy|power)(?![a-z0-9])"
+    r"|(?<![a-z0-9])(?:energy|power)\s{1,4}(?:use|usage|reduction|savings?|dropped|consumption|draw)(?![a-z0-9])"
     ")"
+)
+_FORBIDDEN_SYS_PREFIXES: Tuple[str, ...] = (
+    "/etc",
+    "/proc",
+    "/sys",
+    "/dev",
+    "/boot",
+    "/usr",
+    "/bin",
+    "/sbin",
+    "/lib",
+    "/lib64",
+    "/var",
 )
 
 
@@ -165,6 +205,7 @@ def is_hex64(val: Any) -> bool:
 
 def _fold_and_reject_non_ascii_letters(text: str) -> str:
     """NFKC -> NFKD -> drop Cf/Mn -> reject non-ASCII letters (except micro sign)."""
+    require_ok(len(text) <= MAX_POLICY_TEXT_LEN, "POLICY_TEXT_TOO_LONG", "Policy-scanned text exceeds length cap")
     nfkd = unicodedata.normalize("NFKD", unicodedata.normalize("NFKC", text))
     stripped = "".join(ch for ch in nfkd if unicodedata.category(ch) not in ("Cf", "Mn"))
     require_ok(
@@ -186,9 +227,9 @@ def _check_policy_key_value(key: str, val: Any) -> None:
         return
     spaced_k = re.sub(r"([a-z0-9])([A-Z])", r"\1 \2", clean_k).replace("_", " ").casefold()
     tokens = [tok for tok in re.split(r"[^a-z0-9\u03bc]+", spaced_k) if tok]
-    collapsed = "".join(tokens)
     if (
-        _FORBIDDEN_COMPACT_KEY_RE.search(collapsed) is not None
+        any(_FORBIDDEN_GLUED_TOKEN_RE.search(tok) is not None for tok in tokens)
+        or "".join(tokens) in _FORBIDDEN_KEY_TOKENS
         or _FORBIDDEN_VALUE_RE.search(spaced_k) is not None
         or any(tok in _FORBIDDEN_KEY_TOKENS for tok in tokens)
     ):
@@ -290,7 +331,7 @@ def simulate_hysteresis_vs_bangbang(
 ) -> Dict[str, Any]:
     """Compare filtered Al-Jazari/Petra/Dougong hysteresis governor vs zero-hysteresis bang-bang comparator."""
     ups, dns = validate_knee_ladder(up_knees, dn_knees)
-    require_ok(type(trace_c) in (list, tuple) and len(trace_c) >= 1, "EMPTY_TRACE", "Trace must be non-empty list/tuple")
+    require_ok(type(trace_c) in (list, tuple), "EMPTY_TRACE", "Trace must be non-empty list/tuple")
     raw = [check_frac(x, f"trace[{i}]") for i, x in enumerate(trace_c)]
     filtered = petra_stepped_filter_q(raw, k1=k1, k2=k2)
 
@@ -454,12 +495,163 @@ def validate_governor_certificate(cert: Any) -> None:
     require_ok(is_hex64(got_c) and hmac.compare_digest(got_c, exp_c), "CERT_SHA_MISMATCH", "certificate_sha256 mismatch")
 
 
-def check_certificate_file(path: Path) -> Dict[str, Any]:
-    require_ok(isinstance(path, Path), "BAD_CERT_PATH", "path must be Path")
+def _is_forbidden_system_path(path_str: str) -> bool:
+    norm = re.sub(r"^/+", "/", path_str)
+    if norm == "/":
+        return True
+    if norm.startswith("/dev/shm/"):
+        return False
+    return any(norm == pfx or norm.startswith(pfx + "/") for pfx in _FORBIDDEN_SYS_PREFIXES)
+
+
+def _check_safe_path(path: Path, label: str) -> Path:
+    require_ok(isinstance(path, Path), "BAD_CERT_PATH", f"{label} must be Path")
+    raw = str(path)
+    require_ok(
+        "\x00" not in raw and ".." not in path.parts and not raw.startswith("//"),
+        "UNSAFE_PATH",
+        f"{label} contains NUL, '..', or leading '//'",
+    )
     try:
-        data = json.loads(path.read_text(encoding="utf-8"))
-    except (OSError, UnicodeDecodeError, ValueError, RecursionError) as exc:
-        raise ThermalGovError("READ_OR_JSON_ERR", f"Failed to read/parse governor cert: {exc}") from exc
+        raw.encode("utf-8")
+        abs_path = Path(os.path.abspath(raw))
+        real_parent = Path(os.path.realpath(str(abs_path.parent)))
+    except (OSError, UnicodeEncodeError) as exc:
+        raise ThermalGovError("UNSAFE_PATH", f"{label} path resolution failed: {exc}") from exc
+    resolved = real_parent / abs_path.name
+    require_ok(not _is_forbidden_system_path(resolved.as_posix()), "UNSAFE_PATH", f"{label} targets forbidden system path")
+    require_ok(not resolved.is_symlink(), "UNSAFE_PATH", f"{label} symlink target forbidden")
+    return resolved
+
+
+def _read_text_safe(path: Path, label: str) -> str:
+    safe = _check_safe_path(path, label)
+    parent_fd = -1
+    fd = -1
+    try:
+        parent_fd = os.open(str(safe.parent), os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW)
+        fd = os.open(safe.name, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK, dir_fd=parent_fd)
+        st = os.fstat(fd)
+        require_ok(stat.S_ISREG(st.st_mode), "UNSAFE_PATH", f"{label} must be a regular file")
+        require_ok(st.st_size <= MAX_INPUT_BYTES, "READ_OR_JSON_ERR", f"{label} exceeds max size cap")
+        os.set_blocking(fd, True)
+        with os.fdopen(fd, "rb") as fh:
+            fd = -1
+            return fh.read(MAX_INPUT_BYTES).decode("utf-8")
+    except ThermalGovError:
+        raise
+    except (OSError, UnicodeDecodeError) as exc:
+        raise ThermalGovError("READ_OR_JSON_ERR", f"Failed to read governor cert: {exc}") from exc
+    finally:
+        if fd >= 0:
+            os.close(fd)
+        if parent_fd >= 0:
+            os.close(parent_fd)
+
+
+def _write_text_safe(path: Path, text: str) -> None:
+    safe = _check_safe_path(path, "write")
+    require_ok(safe.parent.is_dir(), "BAD_WRITE_PARENT", "Write target parent directory must exist")
+    parent_fd = -1
+    fd = -1
+    tmp_name = f".{safe.name}.{os.getpid()}.{secrets.token_hex(6)}.tmp"
+    created_tmp = False
+    try:
+        parent_fd = os.open(str(safe.parent), os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW)
+        try:
+            existing = os.stat(safe.name, dir_fd=parent_fd, follow_symlinks=False)
+        except FileNotFoundError:
+            existing = None
+        if existing is not None:
+            require_ok(stat.S_ISREG(existing.st_mode), "UNSAFE_PATH", "Write target must be a regular file")
+            require_ok(existing.st_nlink == 1, "UNSAFE_PATH", "Write target hardlink forbidden")
+        fd = os.open(tmp_name, os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW, 0o644, dir_fd=parent_fd)
+        created_tmp = True
+        raw = text.encode("utf-8")
+        view = memoryview(raw)
+        pos = 0
+        while pos < len(view):
+            n = os.write(fd, view[pos:])
+            require_ok(n > 0, "WRITE_ERR", "Short write to governor cert temp file")
+            pos += n
+        os.fsync(fd)
+        os.close(fd)
+        fd = -1
+        os.replace(tmp_name, safe.name, src_dir_fd=parent_fd, dst_dir_fd=parent_fd)
+        created_tmp = False
+    except ThermalGovError:
+        raise
+    except OSError as exc:
+        raise ThermalGovError("WRITE_ERR", f"Failed to write governor cert: {exc}") from exc
+    finally:
+        if fd >= 0:
+            os.close(fd)
+        if created_tmp:
+            try:
+                os.unlink(tmp_name, dir_fd=parent_fd)
+            except OSError:
+                pass
+        if parent_fd >= 0:
+            os.close(parent_fd)
+
+
+MAX_JSON_INT_DIGITS = 64
+MAX_STRICT_JSON_DEPTH = 64
+
+
+def _check_json_depth(obj: Any, max_depth: int, label: str) -> None:
+    stack: list[tuple[Any, int]] = [(obj, 0)]
+    while stack:
+        cur, depth = stack.pop()
+        require_ok(depth <= max_depth, "JSON_DEPTH", f"{label}: JSON nesting depth exceeds {max_depth}")
+        if type(cur) is dict:
+            for v in cur.values():
+                stack.append((v, depth + 1))
+        elif type(cur) is list:
+            for v in cur:
+                stack.append((v, depth + 1))
+
+
+def _loads_strict_json(raw_text: str, label: str) -> Any:
+    def _reject_const(tok: str) -> Any:
+        raise ThermalGovError("NON_FINITE_JSON", f"{label}: non-finite JSON constant {tok!r} forbidden")
+
+    def _reject_float(tok: str) -> Any:
+        raise ThermalGovError("FLOAT_FORBIDDEN", f"{label}: float literal {tok!r} forbidden")
+
+    def _parse_bounded_int(tok: str) -> int:
+        digits = tok[1:] if tok.startswith("-") else tok
+        require_ok(len(digits) <= MAX_JSON_INT_DIGITS, "INT_TOO_LONG", f"{label}: integer exceeds {MAX_JSON_INT_DIGITS} digits")
+        return int(tok)
+
+    def _reject_dup_keys(pairs: list[tuple[str, Any]]) -> Dict[str, Any]:
+        out: Dict[str, Any] = {}
+        for k, v in pairs:
+            require_ok(k not in out, "DUPLICATE_JSON_KEY", f"{label}: duplicate JSON key {k!r}")
+            out[k] = v
+        return out
+
+    try:
+        parsed = json.loads(
+            raw_text,
+            parse_constant=_reject_const,
+            parse_float=_reject_float,
+            parse_int=_parse_bounded_int,
+            object_pairs_hook=_reject_dup_keys,
+        )
+    except ThermalGovError:
+        raise
+    except RecursionError as exc:
+        raise ThermalGovError("JSON_DEPTH", f"{label}: JSON nesting depth exceeds recursion limit") from exc
+    except ValueError as exc:
+        raise ThermalGovError("READ_OR_JSON_ERR", f"Failed to parse {label}: {exc}") from exc
+    _check_json_depth(parsed, MAX_STRICT_JSON_DEPTH, label)
+    return parsed
+
+
+def check_certificate_file(path: Path) -> Dict[str, Any]:
+    raw_text = _read_text_safe(path, "check")
+    data = _loads_strict_json(raw_text, "governor cert")
     validate_governor_certificate(data)
     expected = certify_thermal_governor()
     require_ok(
@@ -485,7 +677,7 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
         cert = certify_thermal_governor()
         out_text = json.dumps(cert, indent=2, sort_keys=True, ensure_ascii=True, allow_nan=False) + "\n"
         if args.write is not None:
-            args.write.write_text(out_text, encoding="utf-8")
+            _write_text_safe(args.write, out_text)
             print(json.dumps({"status": "WRITTEN", "certificate_sha256": cert["certificate_sha256"]}, sort_keys=True))
             return 0
         sys.stdout.write(out_text)

@@ -719,11 +719,25 @@ class TestShellScripts(unittest.TestCase):
             payload = bundle / "payload"
 
             manifest, _, _, _ = verify_mod._build_fixture(payload, cid, wcid)
-            # Move manifest to bundle root and write MIGRATION_RECEIPT.json
-            (bundle / "MIGRATION_SHA256SUMS").write_text(manifest.read_text(encoding="utf-8"), encoding="utf-8")
+            # Move manifest to bundle root and write complete MIGRATION_RECEIPT.json seal
+            m_bytes = manifest.read_bytes()
+            (bundle / "MIGRATION_SHA256SUMS").write_bytes(m_bytes)
             manifest.unlink()
+            p_files = [p for p in payload.rglob("*") if p.is_file() and not p.is_symlink()]
             (bundle / "MIGRATION_RECEIPT.json").write_text(
-                json.dumps({"schema": "aletheia.migration_receipt.v1", "cid": cid, "mode": "full"}) + "\n",
+                json.dumps(
+                    {
+                        "schema": "aletheia.migration_receipt.v1",
+                        "cid": cid,
+                        "mode": "full",
+                        "file_count": len(p_files),
+                        "total_bytes": sum(p.stat().st_size for p in p_files),
+                        "manifest_sha256": hashlib.sha256(m_bytes).hexdigest(),
+                    },
+                    indent=2,
+                    sort_keys=True,
+                )
+                + "\n",
                 encoding="utf-8",
             )
 

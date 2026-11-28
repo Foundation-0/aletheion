@@ -23,7 +23,10 @@ import hashlib
 import itertools
 import json
 import math
+import os
 from pathlib import Path
+import re
+import stat
 import sys
 from typing import Any, Dict, List, Optional, Sequence, Tuple
 
@@ -31,7 +34,21 @@ SCHEMA_PLUGINS = "aletheion.exoskeleton_plugins.v1"
 MAX_INT_ABS = 10**18
 MAX_KHIPU_DEPTH = 64
 MAX_KHIPU_NODES = 10_000
+MAX_INPUT_BYTES = 16 * 1024 * 1024
 MAX_TORUS_CELLS = 100_000
+_FORBIDDEN_SYS_PREFIXES: Tuple[str, ...] = (
+    "/etc",
+    "/proc",
+    "/sys",
+    "/dev",
+    "/boot",
+    "/usr",
+    "/bin",
+    "/sbin",
+    "/lib",
+    "/lib64",
+    "/var",
+)
 
 # Reproduced literature summation constants from published Open Khipu Repository (OKR) records:
 DEFAULT_KHIPU_WITNESSES: Dict[str, Any] = {
@@ -504,13 +521,113 @@ def run_plugin_selftest(
     return payload
 
 
-def _load_json(path: Path) -> Any:
+def _is_forbidden_system_path(path_str: str) -> bool:
+    norm = re.sub(r"^/+", "/", path_str)
+    if norm == "/":
+        return True
+    if norm.startswith("/dev/shm/"):
+        return False
+    return any(norm == pfx or norm.startswith(pfx + "/") for pfx in _FORBIDDEN_SYS_PREFIXES)
+
+
+def _check_safe_path(path: Path, label: str) -> Path:
+    require_ok(isinstance(path, Path), "UNSAFE_PATH", f"{label} must be Path")
     raw = str(path)
-    require_ok("\x00" not in raw and ".." not in path.parts, "UNSAFE_PATH", "khipu cert path unsafe")
+    require_ok(
+        "\x00" not in raw and ".." not in path.parts and not raw.startswith("//"),
+        "UNSAFE_PATH",
+        f"{label} contains NUL, '..', or leading '//'",
+    )
     try:
-        return json.loads(path.read_text(encoding="utf-8"))
-    except (OSError, UnicodeDecodeError, ValueError, RecursionError) as exc:
+        raw.encode("utf-8")
+        abs_path = Path(os.path.abspath(raw))
+        real_parent = Path(os.path.realpath(str(abs_path.parent)))
+    except (OSError, UnicodeEncodeError) as exc:
+        raise PluginError("UNSAFE_PATH", f"{label} path resolution failed: {exc}") from exc
+    resolved = real_parent / abs_path.name
+    require_ok(not _is_forbidden_system_path(resolved.as_posix()), "UNSAFE_PATH", f"{label} targets forbidden system path")
+    require_ok(not resolved.is_symlink(), "UNSAFE_PATH", f"{label} symlink target forbidden")
+    return resolved
+
+
+MAX_JSON_INT_DIGITS = 64
+MAX_JSON_DEPTH = 64
+
+
+def _check_json_depth(obj: Any, max_depth: int, label: str) -> None:
+    stack: list[tuple[Any, int]] = [(obj, 0)]
+    while stack:
+        cur, depth = stack.pop()
+        require_ok(depth <= max_depth, "JSON_DEPTH", f"{label}: JSON nesting depth exceeds {max_depth}")
+        if type(cur) is dict:
+            for v in cur.values():
+                stack.append((v, depth + 1))
+        elif type(cur) is list:
+            for v in cur:
+                stack.append((v, depth + 1))
+
+
+def _loads_strict_json(raw_text: str, label: str) -> Any:
+    def _reject_const(tok: str) -> Any:
+        raise PluginError("NON_FINITE_JSON", f"{label}: non-finite JSON constant {tok!r} forbidden")
+
+    def _reject_float(tok: str) -> Any:
+        raise PluginError("FLOAT_FORBIDDEN", f"{label}: float literal {tok!r} forbidden")
+
+    def _parse_bounded_int(tok: str) -> int:
+        digits = tok[1:] if tok.startswith("-") else tok
+        require_ok(len(digits) <= MAX_JSON_INT_DIGITS, "INT_TOO_LONG", f"{label}: integer exceeds {MAX_JSON_INT_DIGITS} digits")
+        return int(tok)
+
+    def _reject_dup_keys(pairs: list[tuple[str, Any]]) -> Dict[str, Any]:
+        out: Dict[str, Any] = {}
+        for k, v in pairs:
+            require_ok(k not in out, "DUPLICATE_JSON_KEY", f"{label}: duplicate JSON key {k!r}")
+            out[k] = v
+        return out
+
+    try:
+        parsed = json.loads(
+            raw_text,
+            parse_constant=_reject_const,
+            parse_float=_reject_float,
+            parse_int=_parse_bounded_int,
+            object_pairs_hook=_reject_dup_keys,
+        )
+    except PluginError:
+        raise
+    except RecursionError as exc:
+        raise PluginError("JSON_DEPTH", f"{label}: JSON nesting depth exceeds recursion limit") from exc
+    except ValueError as exc:
+        raise PluginError("READ_OR_JSON_ERR", f"Failed loading {label} JSON: {exc}") from exc
+    _check_json_depth(parsed, MAX_JSON_DEPTH, label)
+    return parsed
+
+
+def _load_json(path: Path) -> Any:
+    safe = _check_safe_path(path, "khipu_cert")
+    parent_fd = -1
+    fd = -1
+    try:
+        parent_fd = os.open(str(safe.parent), os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW)
+        fd = os.open(safe.name, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK, dir_fd=parent_fd)
+        st = os.fstat(fd)
+        require_ok(stat.S_ISREG(st.st_mode), "UNSAFE_PATH", "khipu_cert must be a regular file")
+        require_ok(st.st_size <= MAX_INPUT_BYTES, "READ_OR_JSON_ERR", "khipu_cert exceeds max size cap")
+        os.set_blocking(fd, True)
+        with os.fdopen(fd, "rb") as fh:
+            fd = -1
+            raw_text = fh.read(MAX_INPUT_BYTES).decode("utf-8")
+        return _loads_strict_json(raw_text, "khipu_cert")
+    except PluginError:
+        raise
+    except (OSError, UnicodeDecodeError) as exc:
         raise PluginError("READ_OR_JSON_ERR", f"Failed loading khipu witness JSON: {exc}") from exc
+    finally:
+        if fd >= 0:
+            os.close(fd)
+        if parent_fd >= 0:
+            os.close(parent_fd)
 
 
 def main(argv: Optional[Sequence[str]] = None) -> int:
